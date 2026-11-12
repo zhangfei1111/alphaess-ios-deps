@@ -1,0 +1,139 @@
+name: Build AlphaESS iOS Dependencies
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Prepare Podfile
+        shell: bash
+        run: |
+          cat > 'Podfile' <<'ALPHAESS_PODFILE'
+          source 'https://cdn.cocoapods.org/'
+          platform :ios, '15.0'
+          install! 'cocoapods', :integrate_targets => false
+          use_frameworks! :linkage => :dynamic
+          
+          # 独立编译真正的动态库；不要使用 HBuilderX 强制静态化的 Pods 构建流程。
+          target 'AlphaESSDependencies' do
+            pod 'JSONModel', '1.8.0'
+            pod 'Protobuf', '3.27.2'
+          end
+          ALPHAESS_PODFILE
+      - name: Prepare verify.py
+        shell: bash
+        run: |
+          cat > 'verify.py' <<'ALPHAESS_VERIFY'
+          #!/usr/bin/env python3
+          """验证实际平台、架构、动态库类型及 install name，不能把静态库改名交付。"""
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+          import plistlib
+          import subprocess
+          import sys
+          
+          root = Path(sys.argv[1]).resolve()
+          records = {}
+          for name in ('JSONModel', 'Protobuf'):
+              xc = root / (name + '.xcframework')
+              info = plistlib.loads((xc / 'Info.plist').read_bytes())
+              variants = set()
+              for library in info['AvailableLibraries']:
+                  assert library['SupportedPlatform'] == 'ios', library
+                  simulator = library.get('SupportedPlatformVariant') == 'simulator'
+                  assert not library.get('SupportedPlatformVariant') or simulator, library
+                  expected = {'arm64', 'x86_64'} if simulator else {'arm64'}
+                  assert set(library['SupportedArchitectures']) == expected, library
+                  variants.add('simulator' if simulator else 'device')
+                  binary = xc / library['LibraryIdentifier'] / library['LibraryPath'] / name
+                  archs = set(subprocess.check_output(['lipo', '-archs', str(binary)], text=True).split())
+                  assert archs == expected, (binary, archs)
+                  for arch in sorted(archs):
+                      header = subprocess.check_output(['otool', '-arch', arch, '-hv', str(binary)], text=True)
+                      assert 'DYLIB' in header, binary
+                      commands = subprocess.check_output(['otool', '-arch', arch, '-l', str(binary)], text=True)
+                      assert 'LC_BUILD_VERSION' in commands, binary
+                      # Mach-O 平台枚举：iOS=2，iOS Simulator=7；架构相同不代表平台相同。
+                      platforms = re.findall(r'\bplatform (\S+)', commands)
+                      assert len(platforms) == 1 and platforms[0] in ({'7', 'IOSSIMULATOR'} if simulator else {'2', 'IOS'}), (binary, platforms)
+                      identity = subprocess.check_output(['otool', '-arch', arch, '-D', str(binary)], text=True)
+                      assert '@rpath/' + name + '.framework/' + name in identity, identity
+                  records[str(binary.relative_to(root))] = hashlib.sha256(binary.read_bytes()).hexdigest()
+              assert variants == {'device', 'simulator'}, (name, variants)
+          (root / 'sha256.json').write_text(json.dumps(records, indent=2) + '\n')
+          print('PASS: device/simulator architecture, platform, dynamic type and install names')
+          ALPHAESS_VERIFY
+      - name: Prepare build.sh
+        shell: bash
+        run: |
+          cat > 'build.sh' <<'ALPHAESS_BUILD'
+          #!/bin/bash
+          set -euo pipefail
+          export LANG=en_US.UTF-8
+          export LC_ALL=en_US.UTF-8
+          export COCOAPODS_DISABLE_STATS=true
+          
+          source_dir="$(cd "$(dirname "$0")" && pwd)"
+          build_root="$(mktemp -d "${TMPDIR:-/tmp}/alphaess-deps.XXXXXX")"
+          output_dir="${1:-$source_dir/output}"
+          mkdir -p "$output_dir"
+          output_dir="$(cd "$output_dir" && pwd)"
+          
+          # 不需要开发者证书和 App 工程；失败时保留独立工作目录及构建日志。
+          trap 'echo "Build workspace: $build_root"' EXIT
+          xcrun --sdk iphoneos --show-sdk-path >/dev/null
+          xcrun --sdk iphonesimulator --show-sdk-path >/dev/null
+          command -v pod >/dev/null
+          cp "$source_dir/Podfile" "$build_root/Podfile"
+          cd "$build_root"
+          pod install
+          
+          for sdk in iphoneos iphonesimulator; do
+            architectures=arm64
+            if [ "$sdk" = iphonesimulator ]; then architectures="arm64 x86_64"; fi
+            for library in JSONModel Protobuf; do
+              xcodebuild -project Pods/Pods.xcodeproj -target "$library" \
+                -configuration Release -sdk "$sdk" \
+                "ARCHS=$architectures" ONLY_ACTIVE_ARCH=NO \
+                "CONFIGURATION_BUILD_DIR=$build_root/products/$sdk" \
+                "SYMROOT=$build_root/build/$sdk" \
+                IPHONEOS_DEPLOYMENT_TARGET=15.0 MACH_O_TYPE=mh_dylib \
+                CODE_SIGNING_ALLOWED=NO SKIP_INSTALL=NO \
+                DYLIB_COMPATIBILITY_VERSION=1 DYLIB_CURRENT_VERSION=1 \
+                "LD_DYLIB_INSTALL_NAME=@rpath/$library.framework/$library" \
+                >"$output_dir/$library-$sdk.log" 2>&1 || {
+                  tail -80 "$output_dir/$library-$sdk.log"; exit 1;
+                }
+            done
+          done
+          for library in JSONModel Protobuf; do
+            # 已存在的交付物不覆盖，避免把新旧切片混在一起。
+            test ! -e "$output_dir/$library.xcframework"
+            xcodebuild -create-xcframework \
+              -framework "$build_root/products/iphoneos/$library.framework" \
+              -framework "$build_root/products/iphonesimulator/$library.framework" \
+              -output "$output_dir/$library.xcframework"
+          done
+          cp Podfile.lock "$output_dir/Podfile.lock"
+          cp Pods/JSONModel/LICENSE "$output_dir/JSONModel-LICENSE"
+          cp Pods/Protobuf/LICENSE "$output_dir/Protobuf-LICENSE"
+          xcodebuild -version > "$output_dir/toolchain.txt"
+          pod --version >> "$output_dir/toolchain.txt"
+          python3 "$source_dir/verify.py" "$output_dir"
+          echo "Dynamic XCFrameworks ready: $output_dir"
+          ALPHAESS_BUILD
+      - name: Build unsigned dynamic XCFrameworks
+        run: bash build.sh "$RUNNER_TEMP/alphaess-dependencies"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alphaess-ios-dependencies
+          path: ${{ runner.temp }}/alphaess-dependencies
+          if-no-files-found: error
+          retention-days: 14
